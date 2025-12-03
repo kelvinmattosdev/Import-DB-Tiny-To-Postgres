@@ -1,0 +1,36 @@
+{
+  "name": "import-db-tiny-to-postgres",
+  "version": "1.0.0",
+  "description": "Este repositório tem como objetivo replicar a base de dados do Tiny ERP em um banco próprio, permitindo consultas mais eficientes, redução do impacto de rate limit da API e maior flexibilidade para integrações, relatórios e análises internas.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "tsc",
+    "start": "node dist/main.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RefigureYT/Import-DB-Tiny-To-Postgres.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/RefigureYT/Import-DB-Tiny-To-Postgres/issues"
+  },
+  "homepage": "https://github.com/RefigureYT/Import-DB-Tiny-To-Postgres#readme",
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "pg": "^8.16.3",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/dotenv": "^6.1.1",
+    "@types/node": "^24.10.1",
+    "@types/pg": "^8.15.6",
+    "ts-node-dev": "^2.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
