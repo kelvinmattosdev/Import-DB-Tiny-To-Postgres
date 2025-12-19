@@ -98,6 +98,31 @@ export async function executarQueryInDb<T extends QueryResultRow = QueryResultRo
     }
 }
 
+export async function executarEmTransacao<T>(
+    fn: (client: PoolClient) => Promise<T>
+): Promise<T> {
+    let client: PoolClient | null = null;
+
+    try {
+        client = await pool.connect();
+        await client.query('BEGIN');
+
+        const result = await fn(client);
+
+        await client.query('COMMIT');
+        return result;
+    } catch (error) {
+        if (client) {
+            try {
+                await client.query('ROLLBACK');
+            } catch { }
+        }
+        throw error;
+    } finally {
+        if (client) client.release();
+    }
+}
+
 export interface SchemaInfo extends QueryResultRow {
     schema: string;
     owner: string;
