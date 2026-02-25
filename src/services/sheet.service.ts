@@ -112,7 +112,6 @@ export function filtrarPlanilha<T extends SheetRow = SheetRow>(
 /* =========================================================
  *  HELPERS INTERNOS: PARSE DA PLANILHA
  * =======================================================*/
-
 interface ParsedWorksheet {
     /** Cabeçalhos já normalizados (podem ser string vazia). */
     headers: string[];

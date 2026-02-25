@@ -78,7 +78,7 @@ interface ProdutoRow extends SheetRow {
     ex_tipi: string;
 }
 
-type ImportTipo = 'PRODUTOS' | 'COMPOSICAO';
+type ImportTipo = 'PRODUTOS' | 'COMPOSICAO' | 'FABRICADO';
 
 interface ComposicaoRow extends SheetRow {
     id_comp: number;
@@ -90,6 +90,16 @@ interface ComposicaoRow extends SheetRow {
     produto_kit: string;
 }
 
+interface FabricadoRow extends SheetRow {
+    id_comp: number;
+    sku_comp: string;
+    produto_comp: string;
+    quantidade_comp: number;
+    id_fabricado: number;
+    sku_fabricado: string;
+    produto_fabricado: string;
+}
+
 const COMPOSICAO_COLUMNS: (keyof ComposicaoRow)[] = [
     'id_comp',
     'sku_comp',
@@ -98,6 +108,16 @@ const COMPOSICAO_COLUMNS: (keyof ComposicaoRow)[] = [
     'id_kit',
     'sku_kit',
     'produto_kit'
+];
+
+const FABRICADO_COLUMNS: (keyof FabricadoRow)[] = [
+    'id_comp',
+    'sku_comp',
+    'produto_comp',
+    'quantidade_comp',
+    'id_fabricado',
+    'sku_fabricado',
+    'produto_fabricado'
 ];
 
 // OBS: sheet.service.ts normaliza cabeçalhos automaticamente (remove acentos, troca símbolos por "_", etc.)
@@ -112,6 +132,18 @@ const COMPOSICAO_HEADER_MAP = {
 } as const;
 
 type ComposicaoSourceHeader = keyof typeof COMPOSICAO_HEADER_MAP;
+
+const FABRICADO_HEADER_MAP = {
+    id_kit_fabricado: 'id_fabricado',
+    sku_kit_fabricado: 'sku_fabricado',
+    descricao_kit_fabricado: 'produto_fabricado',
+    id_componente: 'id_comp',
+    sku_componente: 'sku_comp',
+    descricao_componente: 'produto_comp',
+    quantidade_componente: 'quantidade_comp'
+} as const;
+
+type FabricadoSourceHeader = keyof typeof FABRICADO_HEADER_MAP;
 
 // colunas que serão enviadas pro banco (ordem importa!)
 const PRODUTO_COLUMNS: (keyof ProdutoRow)[] = [
@@ -276,8 +308,18 @@ function parseImportTipoFromString(raw: unknown): ImportTipo | null {
     if (normalized === 'PRODUTOS' || normalized === 'PRODUTO') {
         return 'PRODUTOS';
     }
+    if (
+        normalized === 'FABRICADO' ||
+        normalized === 'FABRICADOS' ||
+        normalized === 'FABRICADO_KIT' ||
+        normalized === 'FABRICADO_KITS'
+    ) {
+        return 'FABRICADO';
+    }
 
-    throw new Error(`tipo inválido: "${raw}". Use "PRODUTOS" ou "COMPOSICAO".`);
+    throw new Error(
+        `tipo inválido: "${raw}". Use "PRODUTOS", "COMPOSICAO" ou "FABRICADO".`
+    );
 }
 
 function parseImportTipo(req: IncomingMessage): ImportTipo {
@@ -458,6 +500,163 @@ function buildComposicoesOrThrow(rawRows: SheetRow[]): ComposicaoRow[] {
     return Array.from(agg.values());
 }
 
+function mapFabricadoRow(raw: SheetRow): Partial<FabricadoRow> {
+    const out: Partial<FabricadoRow> = {};
+
+    // Aceita caso a planilha já venha com as chaves finais
+    for (const destKey of FABRICADO_COLUMNS) {
+        const v = (raw as any)[destKey];
+        if (v !== undefined) (out as any)[destKey] = v;
+    }
+
+    // Mapeia do "normalizado da planilha" -> "coluna final"
+    (Object.keys(FABRICADO_HEADER_MAP) as FabricadoSourceHeader[]).forEach((srcKey) => {
+        const destKey = FABRICADO_HEADER_MAP[srcKey];
+        const v = (raw as any)[srcKey];
+        if (v !== undefined) (out as any)[destKey] = v;
+    });
+
+    // Normaliza tipos
+    out.id_comp = normalizeNumber((out as any).id_comp) ?? undefined;
+    out.id_fabricado = normalizeNumber((out as any).id_fabricado) ?? undefined;
+    out.quantidade_comp = normalizeNumber((out as any).quantidade_comp) ?? undefined;
+
+    out.sku_comp = normalizeText((out as any).sku_comp) ?? undefined;
+    out.sku_fabricado = normalizeText((out as any).sku_fabricado) ?? undefined;
+    out.produto_comp = normalizeText((out as any).produto_comp) ?? undefined;
+    out.produto_fabricado = normalizeText((out as any).produto_fabricado) ?? undefined;
+
+    return out;
+}
+
+function isFabricadoRowBlank(r: Partial<FabricadoRow>): boolean {
+    const skuFabricado = (r.sku_fabricado ?? '').toString().trim();
+    const skuComp = (r.sku_comp ?? '').toString().trim();
+    const idFabricado = r.id_fabricado;
+    const idComp = r.id_comp;
+    return (
+        !skuFabricado &&
+        !skuComp &&
+        (idFabricado === undefined || idFabricado === null) &&
+        (idComp === undefined || idComp === null)
+    );
+}
+
+function buildFabricadosOrThrow(rawRows: SheetRow[]): FabricadoRow[] {
+    const SKU_EXCLUIDO = 'PRODUTO_EXCLUIDO' as const;
+
+    // sku_fabricado continua obrigatório (pra você saber de qual FABRICADO é).
+    // sku_comp (componente) pode vir vazio -> vira SKU_EXCLUIDO.
+    const required = [
+        'id_comp',
+        'quantidade_comp',
+        'id_fabricado',
+        'sku_fabricado'
+    ] as const;
+
+    const mapped = rawRows
+        .map(mapFabricadoRow)
+        .filter((r) => !isFabricadoRowBlank(r));
+
+    if (!mapped.length) {
+        throw new Error('Planilha de FABRICADO vazia (nenhuma linha válida encontrada).');
+    }
+
+    const agg = new Map<string, FabricadoRow>();
+    const errors: string[] = [];
+
+    let patchedSkuComp = 0;
+
+    mapped.forEach((r, idx) => {
+        // sku_comp: se não vier, marca como produto excluído
+        const rawSkuComp = (r as any).sku_comp;
+        const skuComp =
+            rawSkuComp === undefined ||
+            rawSkuComp === null ||
+            (typeof rawSkuComp === 'string' && !rawSkuComp.trim())
+                ? (patchedSkuComp++, SKU_EXCLUIDO)
+                : String(rawSkuComp).trim();
+
+        // sku_fabricado: NÃO altera, continua obrigatório
+        const skuFabricado = String((r as any).sku_fabricado ?? '').trim();
+
+        // valida só o que realmente precisa existir
+        const missing = required.filter((k) => {
+            const v = (r as any)[k];
+            return v === undefined || v === null || (typeof v === 'string' && !v.trim());
+        });
+
+        if (missing.length) {
+            errors.push(`linha ${idx + 2}: faltando ${missing.join(', ')}`);
+            return;
+        }
+
+        const idFabricado = Number(r.id_fabricado);
+        const idComp = Number(r.id_comp);
+        const qtd = Number(r.quantidade_comp);
+
+        if (!Number.isFinite(idFabricado) || !Number.isFinite(idComp)) {
+            errors.push(
+                `linha ${idx + 2}: id_fabricado/id_comp inválido (id_fabricado=${r.id_fabricado}, id_comp=${r.id_comp})`
+            );
+            return;
+        }
+
+        if (!Number.isFinite(qtd) || qtd <= 0) {
+            errors.push(`linha ${idx + 2}: quantidade_comp inválida (${r.quantidade_comp})`);
+            return;
+        }
+
+        const key = `${idFabricado}::${idComp}`; // dedupe por ID (preferível)
+        const existing = agg.get(key);
+
+        if (!existing) {
+            agg.set(key, {
+                id_comp: idComp,
+                sku_comp: skuComp,
+                produto_comp: r.produto_comp ? String(r.produto_comp) : '',
+                quantidade_comp: qtd,
+                id_fabricado: idFabricado,
+                sku_fabricado: skuFabricado,
+                produto_fabricado: r.produto_fabricado
+                    ? String(r.produto_fabricado)
+                    : ''
+            });
+        } else {
+            existing.quantidade_comp = Number(existing.quantidade_comp) + qtd;
+
+            // mantém descrições mais “ricas” se vierem depois
+            if (!existing.produto_comp && r.produto_comp) {
+                existing.produto_comp = String(r.produto_comp);
+            }
+            if (!existing.produto_fabricado && r.produto_fabricado) {
+                existing.produto_fabricado = String(r.produto_fabricado);
+            }
+
+            // se antes estava PRODUTO_EXCLUIDO e agora veio SKU real, atualiza
+            if (existing.sku_comp === SKU_EXCLUIDO && skuComp !== SKU_EXCLUIDO) {
+                existing.sku_comp = skuComp;
+            }
+        }
+    });
+
+    if (patchedSkuComp) {
+        console.log(
+            `⚠️ FABRICADO: ${patchedSkuComp} linhas com sku_comp vazio -> usando "${SKU_EXCLUIDO}".`
+        );
+    }
+
+    if (errors.length) {
+        throw new Error(
+            `Planilha de FABRICADO inválida. Problemas (primeiros 10):\n- ${errors
+                .slice(0, 10)
+                .join('\n- ')}`
+        );
+    }
+
+    return Array.from(agg.values());
+}
+
 async function bulkInsertInChunks<T extends SheetRow>(
     client: PoolClient,
     tableFullName: string,
@@ -512,6 +711,24 @@ function normalizeComposicaoByColumn(col: string, rawValue: unknown): unknown {
     if (typeof rawValue === 'string' && rawValue.trim() === '') return null;
 
     if (col === 'id_comp' || col === 'id_kit') {
+        const n = normalizeNumber(rawValue);
+        return n === null ? null : Math.trunc(n);
+    }
+
+    if (col === 'quantidade_comp') {
+        return normalizeNumber(rawValue);
+    }
+
+    // textos
+    return rawValue;
+}
+
+function normalizeFabricadoByColumn(col: string, rawValue: unknown): unknown {
+    if (rawValue === undefined || rawValue === null) return null;
+
+    if (typeof rawValue === 'string' && rawValue.trim() === '') return null;
+
+    if (col === 'id_comp' || col === 'id_fabricado') {
         const n = normalizeNumber(rawValue);
         return n === null ? null : Math.trunc(n);
     }
@@ -579,6 +796,38 @@ async function processFile(xlsxPath: string, chunkSize: number, tipo: ImportTipo
             );
 
             console.log('✅ Importação COMPOSICAO concluída com sucesso.');
+
+            return {
+                tipo,
+                totalLinhas: result.total,
+                chunkSizeUsado: result.chunkSizeUsado,
+                totalChunks: result.chunks
+            };
+        });
+    }
+
+    if (tipo === 'FABRICADO') {
+        // 1) Lê e valida ANTES de mexer no banco
+        const rawRows = sheet.lerPlanilhaComoObjetos<SheetRow>(xlsxPath);
+        const rows = buildFabricadosOrThrow(rawRows);
+
+        console.log(`Planilha FABRICADO: linhas válidas/deduplicadas = ${rows.length}`);
+
+        // 2) TRUNCATE + INSERT dentro de transação (rollback preserva conteúdo antigo)
+        return await psql.executarEmTransacao(async (client: PoolClient) => {
+            console.log('Transação iniciada. Truncando tiny.fabricados...');
+            await client.query('TRUNCATE TABLE tiny.fabricados;');
+
+            const result = await bulkInsertInChunks<FabricadoRow>(
+                client,
+                'tiny.fabricados',
+                FABRICADO_COLUMNS.map(String),
+                rows as any,
+                chunkSize,
+                normalizeFabricadoByColumn
+            );
+
+            console.log('✅ Importação FABRICADO concluída com sucesso.');
 
             return {
                 tipo,
@@ -679,7 +928,13 @@ async function handleImportRequest(
         let tipo: ImportTipo = parseImportTipo(req); // default PRODUTOS
 
         // cria um temp file único
-        tempFilePath = await prepareTempFilePath(tipo === 'COMPOSICAO' ? 'composicao' : 'produtos');
+        tempFilePath = await prepareTempFilePath(
+            tipo === 'COMPOSICAO'
+                ? 'composicao'
+                : tipo === 'FABRICADO'
+                    ? 'fabricado'
+                    : 'produtos'
+        );
 
         const contentType = String(req.headers['content-type'] ?? '').toLowerCase();
 
@@ -795,5 +1050,7 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Servidor HTTP ouvindo na porta ${PORT}.`);
     console.log(`http://localhost:${PORT}/`);
-    console.log(`   POST /importar-produtos (body = XLSX binário, ?chunkSize=opcional, ?tipo=PRODUTOS|COMPOSICAO)`);
+    console.log(
+        `   POST /importar-produtos (body = XLSX binário, ?chunkSize=opcional, ?tipo=PRODUTOS|COMPOSICAO|FABRICADO)`
+    );
 });
