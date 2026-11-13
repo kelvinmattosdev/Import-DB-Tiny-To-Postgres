@@ -20,6 +20,8 @@ Atualmente o projeto expõe uma **API HTTP** que recebe uma planilha `XLSX` com 
   - Valida `chunkSize` e limita a **no máximo 1000** linhas por chunk.
   - Salva a planilha em `temp/produtos.xlsx` (limpando a pasta antes).
   - Normaliza os dados (inclusive numéricos com `,` e `.`).
+  - Para SKUs duplicados, mantém o produto com a maior pontuação de completude.
+  - Em caso de empate na maior pontuação, mantém os empatados e gera um alerta no terminal.
   - Trunca a tabela `tiny.produtos` e reimporta tudo em lote.
   - Remove o arquivo temporário ao final.
 - Inserção em **lotes parametrizados** para melhor performance.
@@ -263,13 +265,18 @@ Resposta (exemplo):
 1. Salva o arquivo recebido em `temp/produtos.xlsx`.
 2. **Apaga qualquer arquivo existente na pasta `temp/` antes** de salvar o novo.
 3. Testa a conexão com o banco.
-4. Executa `TRUNCATE tiny.produtos RESTART IDENTITY CASCADE`.
-5. Lê todas as linhas da planilha (`sheet.service.ts`).
-6. Divide em chunks de até `chunkSize` linhas.
-7. Para cada chunk:
+4. Lê todas as linhas da planilha (`sheet.service.ts`).
+5. Antes de alterar o banco, agrupa os SKUs duplicados (ignorando espaços nas pontas e diferenças entre maiúsculas/minúsculas) e pontua cada produto:
+   - `preco_de_custo` e `estoque`: 1 ponto cada quando maiores que zero;
+   - `variacoes`, `categoria`, `gtin_ean`, `cod_do_fornecedor` e `fornecedor`: 1 ponto cada quando preenchidos;
+   - `url_imagem_externa_1` até `url_imagem_externa_10`: 1 ponto por URL preenchida.
+6. Mantém apenas a maior pontuação de cada SKU; se houver empate na maior nota, mantém todos os empatados e escreve um `ALERTA` no terminal.
+7. Dentro de uma transação, executa `TRUNCATE tiny.produtos` e insere as linhas selecionadas.
+8. Divide em chunks de até `chunkSize` linhas.
+9. Para cada chunk:
    - Normaliza colunas numéricas (`"10,50"`, `"10.50"`, `""` → `10.5`/`null`).
    - Monta um único `INSERT INTO ... VALUES (...), (...), ...` com placeholders.
-8. Ao final, remove `temp/produtos.xlsx` e responde a requisição.
+10. Ao final, remove `temp/produtos.xlsx` e responde a requisição.
 
 ---
 

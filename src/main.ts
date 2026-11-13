@@ -4,6 +4,11 @@ import fs from 'fs';
 import http, { IncomingMessage, ServerResponse } from 'http';
 import * as services from './index.js';
 import type { SheetRow } from './services/sheet.service.js';
+import {
+    PRODUCT_COMPLETENESS_CRITERIA,
+    selectMostCompleteProductsBySku,
+    type DuplicateSkuDecision
+} from './services/product-deduplication.service.js';
 import { fileURLToPath } from 'url';
 import type { PoolClient } from 'pg';
 
@@ -403,7 +408,7 @@ function isComposicaoRowBlank(r: Partial<ComposicaoRow>): boolean {
 function buildComposicoesOrThrow(rawRows: SheetRow[]): ComposicaoRow[] {
     const SKU_EXCLUIDO = 'PRODUTO_EXCLUIDO' as const;
 
-    // sku_kit continua obrigatório (pra você saber de qual KIT é).
+    // Linhas cujo KIT não tem SKU não podem ser relacionadas no destino e são descartadas.
     // sku_comp (componente) pode vir vazio -> vira SKU_EXCLUIDO.
     const required = ['id_comp', 'quantidade_comp', 'id_kit', 'sku_kit'] as const;
 
@@ -419,6 +424,7 @@ function buildComposicoesOrThrow(rawRows: SheetRow[]): ComposicaoRow[] {
     const errors: string[] = [];
 
     let patchedSkuComp = 0;
+    let discardedMissingSkuKit = 0;
 
     mapped.forEach((r, idx) => {
         // sku_comp: se não vier, marca como produto excluído
@@ -430,8 +436,12 @@ function buildComposicoesOrThrow(rawRows: SheetRow[]): ComposicaoRow[] {
                 ? (patchedSkuComp++, SKU_EXCLUIDO)
                 : String(rawSkuComp).trim();
 
-        // sku_kit: NÃO altera, continua obrigatório
+        // Sem SKU do KIT, não há como vincular a composição. Descarta somente esta linha.
         const skuKit = String((r as any).sku_kit ?? '').trim();
+        if (!skuKit) {
+            discardedMissingSkuKit += 1;
+            return;
+        }
 
         // valida só o que realmente precisa existir
         const missing = required.filter((k) => {
@@ -488,6 +498,12 @@ function buildComposicoesOrThrow(rawRows: SheetRow[]): ComposicaoRow[] {
     if (patchedSkuComp) {
         console.log(
             `⚠️ COMPOSICAO: ${patchedSkuComp} linhas com sku_comp vazio -> usando "${SKU_EXCLUIDO}".`
+        );
+    }
+
+    if (discardedMissingSkuKit) {
+        console.warn(
+            `⚠️ COMPOSICAO: ${discardedMissingSkuKit} linhas descartadas porque o KIT não possui sku_kit.`
         );
     }
 
@@ -741,6 +757,30 @@ function normalizeFabricadoByColumn(col: string, rawValue: unknown): unknown {
     return rawValue;
 }
 
+function formatProductCandidate(candidate: DuplicateSkuDecision['candidates'][number]): string {
+    const id = candidate.id ?? `linha ${candidate.rowIndex + 2}`;
+    return `${id}: ${candidate.score} ponto(s)${candidate.selected ? ' [mantido]' : ' [descartado]'}`;
+}
+
+function logDuplicateSkuDecisions(decisions: DuplicateSkuDecision[]): void {
+    for (const decision of decisions) {
+        const candidates = decision.candidates
+            .map(formatProductCandidate)
+            .join(' | ');
+
+        if (decision.tied) {
+            console.warn(
+                `🚨 ALERTA — SKU duplicado "${decision.sku}" empatou com ${decision.highestScore}/${PRODUCT_COMPLETENESS_CRITERIA.length} pontos. Todos os produtos com a maior nota serão inseridos. ${candidates}`
+            );
+            continue;
+        }
+
+        console.log(
+            `ℹ️ SKU duplicado "${decision.sku}": mantido o produto mais completo (${decision.highestScore}/${PRODUCT_COMPLETENESS_CRITERIA.length} pontos). ${candidates}`
+        );
+    }
+}
+
 async function readBodyAsBuffer(req: IncomingMessage): Promise<Buffer> {
     const chunks: Buffer[] = [];
     await new Promise<void>((resolve, reject) => {
@@ -842,24 +882,30 @@ async function processFile(xlsxPath: string, chunkSize: number, tipo: ImportTipo
     const linhas = sheet.lerPlanilhaComoObjetos<ProdutoRow>(xlsxPath);
 
     // remove linhas totalmente vazias (bem comum no final do XLSX)
-    const rows = linhas.filter((r) => {
+    const validRows = linhas.filter((r) => {
         const sku = String((r as any).codigo_sku ?? '').trim();
         const id = String((r as any).id ?? '').trim();
         const desc = String((r as any).descricao ?? '').trim();
         return sku || id || desc;
     });
 
-    if (!rows.length) {
+    if (!validRows.length) {
         throw new Error('Planilha de PRODUTOS vazia (nenhuma linha válida encontrada).');
     }
 
     // valida mínima pra evitar “planilha errada”
-    const first = rows[0] as any;
+    const first = validRows[0] as any;
     if (first.codigo_sku === undefined || first.descricao === undefined) {
         throw new Error('Planilha de PRODUTOS inválida: não encontrei colunas "codigo_sku" e/ou "descricao".');
     }
 
-    console.log(`Planilha PRODUTOS: linhas válidas = ${rows.length}`);
+    const deduplication = selectMostCompleteProductsBySku(validRows);
+    const rows = deduplication.rows;
+
+    logDuplicateSkuDecisions(deduplication.decisions);
+    console.log(
+        `Planilha PRODUTOS: ${validRows.length} linhas válidas; ${deduplication.duplicateSkuGroups} SKU(s) duplicado(s); ${deduplication.removedRows} linha(s) descartada(s); ${rows.length} linha(s) para inserir.`
+    );
 
     return await psql.executarEmTransacao(async (client: PoolClient) => {
         console.log('Transação iniciada. Truncando tiny.produtos...');
@@ -879,6 +925,10 @@ async function processFile(xlsxPath: string, chunkSize: number, tipo: ImportTipo
         return {
             tipo: 'PRODUTOS' as ImportTipo,
             totalLinhas: result.total,
+            totalLinhasOriginais: validRows.length,
+            totalSkusDuplicados: deduplication.duplicateSkuGroups,
+            totalLinhasDescartadas: deduplication.removedRows,
+            totalEmpates: deduplication.tiedGroups,
             chunkSizeUsado: result.chunkSizeUsado,
             totalChunks: result.chunks
         };
@@ -1042,15 +1092,26 @@ async function router(req: IncomingMessage, res: ServerResponse): Promise<void> 
     res.end(JSON.stringify({ error: 'Rota não encontrada.' }));
 }
 
-// Cria o servidor HTTP
-const server = http.createServer((req, res) => {
-    void router(req, res);
-});
+export { buildComposicoesOrThrow };
 
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Servidor HTTP ouvindo na porta ${PORT}.`);
-    console.log(`http://localhost:${PORT}/`);
-    console.log(
-        `   POST /importar-produtos (body = XLSX binário, ?chunkSize=opcional, ?tipo=PRODUTOS|COMPOSICAO|FABRICADO)`
-    );
-});
+// O PM2 importa este módulo por meio de ProcessContainerFork.js; nesse caso
+// process.argv[1] aponta para o wrapper, e não para este arquivo.
+const isDirectExecution =
+    process.argv[1] !== undefined && path.resolve(process.argv[1]) === __filename;
+const isPm2Execution =
+    process.env.pm_exec_path !== undefined &&
+    path.resolve(process.env.pm_exec_path) === __filename;
+
+if (isDirectExecution || isPm2Execution) {
+    const server = http.createServer((req, res) => {
+        void router(req, res);
+    });
+
+    server.listen(PORT, '0.0.0.0', () => {
+        console.log(`🚀 Servidor HTTP ouvindo na porta ${PORT}.`);
+        console.log(`http://localhost:${PORT}/`);
+        console.log(
+            `   POST /importar-produtos (body = XLSX binário, ?chunkSize=opcional, ?tipo=PRODUTOS|COMPOSICAO|FABRICADO)`
+        );
+    });
+}
